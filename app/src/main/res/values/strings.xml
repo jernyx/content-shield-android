@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">ContentShield</string>
+    <string name="accessibility_service_description">ContentShield needs this to detect and immediately block apps you\'ve restricted.</string>
+</resources>
