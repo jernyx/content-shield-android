@@ -68,6 +68,10 @@ class BlockedPackageInstallReceiver : android.content.BroadcastReceiver() {
         val blockedSet = prefs.getStringSet("blocked_packages", emptySet()) ?: emptySet()
         if (pkg !in blockedSet) return
 
+        // Don't re-suspend a package that is currently temporarily unblocked.
+        val tempUntilMs = prefs.getLong("temp_unblock_until_$pkg", 0L)
+        if (tempUntilMs > System.currentTimeMillis()) return
+
         val dpm = context.getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager
         val adminComponent = ComponentName(context, MyDeviceAdminReceiver::class.java)
         if (!dpm.isDeviceOwnerApp(context.packageName)) return
@@ -1990,7 +1994,18 @@ class MainActivity : Activity() {
     private fun resyncBlockedPackages(isDeviceOwner: Boolean) {
         if (!isDeviceOwner) return
         val blockedSet = prefs.getStringSet("blocked_packages", emptySet()) ?: emptySet()
+        val nowMs = System.currentTimeMillis()
         for (pkg in blockedSet) {
+            // Skip packages that are currently temporarily unblocked — suspending them here
+            // would immediately re-block them the moment the user opens ContentShield,
+            // defeating the temporary unblock. The AccessibilityService handles re-blocking
+            // once the timer expires.
+            val tempUntilMs = prefs.getLong("temp_unblock_until_$pkg", 0L)
+            if (tempUntilMs > nowMs) continue
+
+            // If a temp unblock entry exists but has already expired, clean it up now.
+            if (tempUntilMs > 0L) prefs.edit().remove("temp_unblock_until_$pkg").apply()
+
             try {
                 // No-op if already suspended; actually applies it if the package just
                 // became installed again (e.g. reinstalled) since we last checked.
@@ -2199,19 +2214,41 @@ class MainActivity : Activity() {
 
             btnUnblock.setOnClickListener {
                 if (!checkDeviceOwner(isDeviceOwner)) return@setOnClickListener
-                val activeDelayMinutes = prefs.getInt("saved_delay_minutes", 30)
-                btnUnblock.visibility = GONE
-                tvCountdown.visibility = VISIBLE
-                inCountdownMode.add(pkg)
-                if (activeDelayMinutes <= 0) {
-                    appCountdownEndTimes[pkg] = SystemClock.elapsedRealtime()
-                    tvCountdown.text = "00:00:00"
-                    tvCountdown.setOnClickListener { showUnblockConfirmDialog(pkg) }
-                } else {
-                    val totalMs = activeDelayMinutes * 60 * 1000L
-                    val endTime = SystemClock.elapsedRealtime() + totalMs
-                    appCountdownEndTimes[pkg] = endTime
-                    startAppCountdownTicker(endTime)
+                showUnblockDurationDialog(pkg, btnUnblock, tvCountdown) { durationMinutes ->
+                    val activeDelayMinutes = prefs.getInt("saved_delay_minutes", 30)
+                    btnUnblock.visibility = GONE
+                    tvCountdown.visibility = VISIBLE
+                    inCountdownMode.add(pkg)
+                    if (activeDelayMinutes <= 0) {
+                        appCountdownEndTimes[pkg] = SystemClock.elapsedRealtime()
+                        tvCountdown.text = "00:00:00"
+                        if (durationMinutes != null) {
+                            // Temporary unblock: unsuspend now, store re-block time
+                            temporarilyUnsuspendPackage(pkg, durationMinutes)
+                            inCountdownMode.remove(pkg)
+                            appCountdownEndTimes.remove(pkg)
+                            tvCountdown.visibility = GONE
+                            btnUnblock.visibility = VISIBLE
+                        } else {
+                            tvCountdown.setOnClickListener { showUnblockConfirmDialog(pkg) }
+                        }
+                    } else {
+                        if (durationMinutes != null) {
+                            // Temporary unblock path — still go through delay countdown first,
+                            // then on confirm we do a temporary unsuspend
+                            val totalMs = activeDelayMinutes * 60 * 1000L
+                            val endTime = SystemClock.elapsedRealtime() + totalMs
+                            appCountdownEndTimes[pkg] = endTime
+                            // Store pending temp unblock duration so confirm knows it's temporary
+                            prefs.edit().putInt("pending_temp_unblock_minutes_$pkg", durationMinutes).apply()
+                            startAppCountdownTicker(endTime)
+                        } else {
+                            val totalMs = activeDelayMinutes * 60 * 1000L
+                            val endTime = SystemClock.elapsedRealtime() + totalMs
+                            appCountdownEndTimes[pkg] = endTime
+                            startAppCountdownTicker(endTime)
+                        }
+                    }
                 }
             }
 
@@ -2235,6 +2272,26 @@ class MainActivity : Activity() {
                 inCountdownMode.remove(pkg)
                 appCountdownEndTimes.remove(pkg)
                 unsuspendPackage(pkg)
+            }
+
+            // Restore temp-unblock UI if this package is currently temporarily unblocked.
+            // We reuse tvCountdown (the inline HH:MM:SS slot next to the package name) so
+            // the temp countdown looks identical to the delay countdown, and tapping it
+            // shows a "Re-block / Cancel" popup.
+            val tempUntilMs = prefs.getLong("temp_unblock_until_$pkg", 0L)
+            val nowMs = System.currentTimeMillis()
+            if (tempUntilMs > nowMs) {
+                btnUnblock.visibility = GONE
+                tvCountdown.visibility = VISIBLE
+                val remainingMs = tempUntilMs - nowMs
+                val h = (remainingMs / 3_600_000) % 24
+                val m = (remainingMs / 60_000) % 60
+                val s = (remainingMs / 1_000) % 60
+                tvCountdown.text = String.format(Locale.US, "%02d:%02d:%02d", h, m, s)
+                tvCountdown.setOnClickListener { showTempUnblockActiveDialog(pkg) }
+            } else if (tempUntilMs > 0L) {
+                // Expired while app was closed — clean up (AccessibilityService already re-blocked)
+                prefs.edit().remove("temp_unblock_until_$pkg").apply()
             }
 
             topRow.addView(tvPkgName)
@@ -2645,6 +2702,37 @@ class MainActivity : Activity() {
 
         blockedSet.toList().forEach { pkg ->
             val row = blockedAppRowViews[pkg] ?: return@forEach
+
+            // --- Temporary unblock countdown tick ---
+            val tempUntilMs = prefs.getLong("temp_unblock_until_$pkg", 0L)
+            if (tempUntilMs > 0L) {
+                val remaining = tempUntilMs - System.currentTimeMillis()
+                if (remaining > 0) {
+                    val h = (remaining / 3_600_000) % 24
+                    val m = (remaining / 60_000) % 60
+                    val s = (remaining / 1_000) % 60
+                    row.tvCountdown.text = String.format(Locale.US, "%02d:%02d:%02d", h, m, s)
+                    row.tvCountdown.visibility = VISIBLE
+                    row.tvCountdown.setOnClickListener { showTempUnblockActiveDialog(pkg) }
+                    row.btnUnblock.visibility = GONE
+                    row.tvStatus.visibility = GONE
+                    row.btnCancel.visibility = GONE
+                    row.btnApply.visibility = GONE
+                    return@forEach // don't apply normal pending-unblock logic while temp unblocked
+                } else {
+                    // Temp unblock expired while app was open — re-suspend now
+                    prefs.edit().remove("temp_unblock_until_$pkg").apply()
+                    try { dpm.setPackagesSuspended(adminComponent, arrayOf(pkg), true) } catch (_: Exception) {}
+                    row.tvCountdown.visibility = GONE
+                    row.tvCountdown.setOnClickListener(null)
+                    row.tvStatus.visibility = GONE
+                    row.btnCancel.visibility = GONE
+                    row.btnApply.visibility = GONE
+                    row.btnUnblock.visibility = VISIBLE
+                    return@forEach // don't let the normal pending-unblock logic interfere
+                }
+            }
+
             val verifyKey = "unblock_$pkg"
             val isAwaitingConfirm = prefs.getBoolean("is_awaiting_confirm_$verifyKey", false)
             val isPendingUnblock = prefs.getBoolean("is_pending_unblock_$pkg", false)
@@ -2664,7 +2752,11 @@ class MainActivity : Activity() {
                 if (verifyKey !in awaitingInitialFetch && pkg !in inCountdownMode) {
                     row.tvStatus.visibility = GONE
                     row.btnCancel.visibility = GONE
-                    row.btnUnblock.visibility = VISIBLE
+                    // Only show btnUnblock if not currently in a temp-unblock state
+                    val tempUntil = prefs.getLong("temp_unblock_until_$pkg", 0L)
+                    if (tempUntil <= System.currentTimeMillis()) {
+                        row.btnUnblock.visibility = VISIBLE
+                    }
                 }
                 return@forEach
             }
@@ -3041,25 +3133,133 @@ class MainActivity : Activity() {
 
     private fun showUnblockConfirmDialog(pkg: String) {
         val row = blockedAppRowViews[pkg]
+        val pendingTempMinutes = prefs.getInt("pending_temp_unblock_minutes_$pkg", -1)
+        val isTempUnblock = pendingTempMinutes > 0
+
         val dialog = themedDialogBuilder()
             .setView(themedDialogContent(
                 "Remove block?",
-                "Are you sure you want to remove this block?"
+                if (isTempUnblock) "Unblock for $pendingTempMinutes ${if (pendingTempMinutes == 1) "minute" else "minutes"}, then re-block automatically?"
+                else "Are you sure you want to remove this block?"
             ))
             .setPositiveButton("Confirm") { _, _ ->
                 inCountdownMode.remove(pkg)
                 appCountdownEndTimes.remove(pkg)
-                unsuspendPackage(pkg)
+                if (isTempUnblock) {
+                    prefs.edit().remove("pending_temp_unblock_minutes_$pkg").apply()
+                    temporarilyUnsuspendPackage(pkg, pendingTempMinutes)
+                } else {
+                    unsuspendPackage(pkg)
+                }
             }
             .setNegativeButton("Cancel") { _, _ ->
                 inCountdownMode.remove(pkg)
                 appCountdownEndTimes.remove(pkg)
+                prefs.edit().remove("pending_temp_unblock_minutes_$pkg").apply()
                 row?.tvCountdown?.visibility = GONE
                 row?.btnUnblock?.visibility = VISIBLE
             }
             .create()
         applyDialogTheme(dialog)
         dialog.show()
+    }
+
+    // Shown when the user taps the HH:MM:SS countdown while an app is temporarily unblocked.
+    // "Re-block" cancels immediately; "Cancel" dismisses with no change.
+    private fun showTempUnblockActiveDialog(pkg: String) {
+        val row = blockedAppRowViews[pkg]
+        val dialog = themedDialogBuilder()
+            .setView(themedDialogContent(
+                "Temporarily unblocked",
+                "Re-block now or let the timer run out?"
+            ))
+            .setPositiveButton("Re-block") { _, _ ->
+                prefs.edit().remove("temp_unblock_until_$pkg").apply()
+                try { dpm.setPackagesSuspended(adminComponent, arrayOf(pkg), true) } catch (_: Exception) {}
+                row?.tvCountdown?.visibility = GONE
+                row?.tvCountdown?.setOnClickListener(null)
+                row?.btnUnblock?.visibility = VISIBLE
+            }
+            .setNegativeButton("Cancel", null)
+            .create()
+        applyDialogTheme(dialog)
+        dialog.show()
+    }
+
+    // Shows a dialog asking for optional unblock duration (empty = permanent).
+    // onProceed is called with: null for permanent unblock, or Int (minutes) for temporary.
+    private fun showUnblockDurationDialog(
+        pkg: String,
+        btnUnblock: TextView,
+        tvCountdown: TextView,
+        onProceed: (durationMinutes: Int?) -> Unit
+    ) {
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dp(24), dp(16), dp(24), dp(0))
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val input = EditText(this).apply {
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER
+            setTextColor(Color.WHITE)
+            setHintTextColor(Color.GRAY)
+        }
+        val tvUnit = TextView(this).apply {
+            text = "minutes"
+            setTextColor(Color.WHITE)
+            setPadding(dp(8), 0, 0, 0)
+        }
+        container.addView(input)
+        container.addView(tvUnit)
+        container.layoutParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { bottomMargin = dp(24) }
+
+        val dialog = themedDialogBuilder()
+            .setView(themedDialogContent(
+                "Unblock duration?",
+                "Type duration for temporary unblock. Leave empty to unblock forever.",
+                container
+            ))
+            .setPositiveButton("Unblock") { _, _ ->
+                val text = input.text.toString().trim()
+                if (text.isEmpty()) {
+                    onProceed(null) // permanent
+                } else {
+                    val minutes = text.toIntOrNull()
+                    if (minutes != null && minutes > 0) {
+                        onProceed(minutes) // temporary
+                    } else {
+                        onProceed(null) // invalid → permanent
+                    }
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .create()
+        applyDialogTheme(dialog)
+        dialog.window?.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+        dialog.show()
+    }
+
+    // Temporarily unsuspends a package for durationMinutes, stores the re-block epoch time
+    // in SharedPreferences. The AccessibilityService re-suspends it on the next window event
+    // after the duration expires — no timers or alarms needed.
+    private fun temporarilyUnsuspendPackage(pkg: String, durationMinutes: Int) {
+        val reBlockAtMs = System.currentTimeMillis() + (durationMinutes * 60 * 1000L)
+        prefs.edit()
+            .putLong("temp_unblock_until_$pkg", reBlockAtMs)
+            .apply()
+
+        // Actually unsuspend (but keep in blocked_packages so the AccessibilityService
+        // knows it should be re-blocked once the timer expires)
+        try {
+            dpm.setPackagesSuspended(adminComponent, arrayOf(pkg), false)
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+
+        // Refresh UI to show the countdown row
+        refreshBlockedAppsList(dpm.isDeviceOwnerApp(packageName))
     }
 
     private fun showUrlRemoveConfirmDialog(url: String) {

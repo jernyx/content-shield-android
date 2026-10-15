@@ -146,11 +146,39 @@ class BlockerAccessibilityService : AccessibilityService() {
         return false
     }
 
+    // Checks all packages that have a temporary unblock timer. If any have expired,
+    // re-suspends them and clears the pref. Runs on every accessibility event — no
+    // timers or alarms, purely event-driven.
+    private fun checkAndReApplyExpiredTempUnblocks(prefs: android.content.SharedPreferences) {
+        if (!::dpm.isInitialized || !dpm.isDeviceOwnerApp(packageName)) return
+        val adminComponent = ComponentName(this, MyDeviceAdminReceiver::class.java)
+        val blockedSet = prefs.getStringSet("blocked_packages", emptySet()) ?: emptySet()
+        val nowMs = System.currentTimeMillis()
+        val edit = prefs.edit()
+        var changed = false
+        for (pkg in blockedSet) {
+            val tempUntilMs = prefs.getLong("temp_unblock_until_$pkg", 0L)
+            if (tempUntilMs > 0L && nowMs >= tempUntilMs) {
+                // Timer has expired — re-suspend the package
+                try { dpm.setPackagesSuspended(adminComponent, arrayOf(pkg), true) } catch (_: Exception) {}
+                edit.remove("temp_unblock_until_$pkg")
+                changed = true
+                Log.d("ContentShield", "Temp unblock expired, re-blocked: $pkg")
+            }
+        }
+        if (changed) edit.apply()
+    }
+
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event?.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
             event?.eventType != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) return
 
         val pkg = event.packageName?.toString() ?: return
+
+        // Check and re-apply any expired temporary unblocks on every event (event-driven,
+        // no timers). This is the mechanism that auto-re-blocks after temp duration expires.
+        val prefs = getSharedPreferences("ContentShieldPrefs", Context.MODE_PRIVATE)
+        checkAndReApplyExpiredTempUnblocks(prefs)
 
         // --- Settings tamper-protection (existing logic, unchanged) ---
         if (pkg in settingsPackages) {
@@ -161,8 +189,7 @@ class BlockerAccessibilityService : AccessibilityService() {
                 Log.d("ContentShield", "Window changed. pkg=$pkg className=$className")
 
                 if (isSubSettingsScreen) {
-                    val guardPrefs = getSharedPreferences("ContentShieldPrefs", Context.MODE_PRIVATE)
-                    val isUninstallBlocked = guardPrefs.getBoolean("is_uninstall_blocked_enabled", false)
+                    val isUninstallBlocked = prefs.getBoolean("is_uninstall_blocked_enabled", false)
 
                     if (isUninstallBlocked) {
                         val rootNode = rootInActiveWindow
@@ -203,7 +230,6 @@ class BlockerAccessibilityService : AccessibilityService() {
         // Fires on both WINDOW_STATE_CHANGED (new tab/navigation) and
         // WINDOW_CONTENT_CHANGED (address bar typed/updated). Both are event-driven.
         if (pkg in browserUrlBarIds || isBrowserPackage(pkg)) {
-            val prefs = getSharedPreferences("ContentShieldPrefs", Context.MODE_PRIVATE)
             val blockedUrls = prefs.getStringSet("blocked_urls", emptySet()) ?: emptySet()
 
             if (blockedUrls.isNotEmpty()) {
@@ -227,9 +253,12 @@ class BlockerAccessibilityService : AccessibilityService() {
         lastHandledPackage = pkg
         if (pkg == packageName) return
 
-        val prefs = getSharedPreferences("ContentShieldPrefs", Context.MODE_PRIVATE)
         val blockedSet = prefs.getStringSet("blocked_packages", emptySet()) ?: emptySet()
         if (pkg !in blockedSet) return
+
+        // Don't kick home if this package is currently temporarily unblocked
+        val tempUntilMs = prefs.getLong("temp_unblock_until_$pkg", 0L)
+        if (tempUntilMs > System.currentTimeMillis()) return
 
         if (!::dpm.isInitialized || !dpm.isDeviceOwnerApp(packageName)) return
 
