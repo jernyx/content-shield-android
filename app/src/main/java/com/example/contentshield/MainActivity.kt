@@ -3218,7 +3218,7 @@ class MainActivity : Activity() {
         val dialog = themedDialogBuilder()
             .setView(themedDialogContent(
                 "Unblock duration?",
-                "Type duration for temporary unblock. Leave empty to unblock forever.",
+                "Type duration for temporary unblock. Leave empty to unblock permanently.",
                 container
             ))
             .setPositiveButton("Unblock") { _, _ ->
