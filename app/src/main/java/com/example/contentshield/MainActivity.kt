@@ -173,6 +173,8 @@ class MainActivity : Activity() {
     // Persists countdown end times (SystemClock.elapsedRealtime) so timers survive list rebuilds
     private val appCountdownEndTimes = mutableMapOf<String, Long>()
     private val urlCountdownEndTimes = mutableMapOf<String, Long>()
+    // Tracks in-memory end times for URL temporary unblocks (System.currentTimeMillis epoch)
+    private val urlTempUnblockEndTimes = mutableMapOf<String, Long>()
 
     // Tracks keys currently waiting on the *initial* getNetworkTime() call fired when a
     // countdown is first started (in initiateTurnOffDelay / initiateUnblockDelay /
@@ -552,6 +554,7 @@ class MainActivity : Activity() {
         refreshBlockedAppsList(isDeviceOwner)
         refreshBlockedUrlsList()
         updateAccessibilityWarningUI()
+        restoreImportCountdownIfNeeded()
     }
 
     // =========================================================================================
@@ -1840,6 +1843,13 @@ class MainActivity : Activity() {
             val totalMs = delayMinutes * 60 * 1000L
             importCountdownEndTime = SystemClock.elapsedRealtime() + totalMs
 
+            // Persist so the countdown survives app restart
+            prefs.edit()
+                .putLong("import_countdown_end_ms", System.currentTimeMillis() + totalMs)
+                .putStringSet("import_pending_packages", packages)
+                .putStringSet("import_pending_urls", urls)
+                .apply()
+
             // Show initial time immediately
             val h = (totalMs / 3_600_000) % 24
             val m = (totalMs / 60_000)    % 60
@@ -1888,14 +1898,92 @@ class MainActivity : Activity() {
         importCountdownHandler   = null
         importPendingPackages    = emptySet()
         importPendingUrls        = emptySet()
+        prefs.edit()
+            .remove("import_countdown_end_ms")
+            .remove("import_pending_packages")
+            .remove("import_pending_urls")
+            .apply()
         // Hide inline timer, restore row to idle state
         tvImportCountdown.visibility = View.INVISIBLE
+    }
+
+    // Rebuilds the import countdown UI after the app has been restarted mid-countdown.
+    // Mirrors startImportCountdown but derives the end time from the persisted epoch value
+    // instead of computing it fresh from the delay setting.
+    private fun restoreImportCountdownIfNeeded() {
+        val importEndMs = prefs.getLong("import_countdown_end_ms", 0L)
+        if (importEndMs == 0L) return
+
+        val pendingPackages = prefs.getStringSet("import_pending_packages", emptySet()) ?: emptySet()
+        val pendingUrls     = prefs.getStringSet("import_pending_urls",     emptySet()) ?: emptySet()
+        if (pendingPackages.isEmpty() && pendingUrls.isEmpty()) {
+            prefs.edit()
+                .remove("import_countdown_end_ms")
+                .remove("import_pending_packages")
+                .remove("import_pending_urls")
+                .apply()
+            return
+        }
+
+        importPendingPackages = pendingPackages
+        importPendingUrls     = pendingUrls
+
+        val remainingMs = importEndMs - System.currentTimeMillis()
+        importCountdownEndTime = SystemClock.elapsedRealtime() + maxOf(remainingMs, 0L)
+        tvImportCountdown.visibility = VISIBLE
+
+        if (remainingMs <= 0) {
+            // Countdown already elapsed while app was closed — show tappable 00:00:00
+            tvImportCountdown.text = "00:00:00"
+            tvImportCountdown.setOnClickListener {
+                val d = themedDialogBuilder()
+                    .setView(themedDialogContent("Apply import?", "Import the blocklist now?"))
+                    .setPositiveButton("Confirm") { _, _ -> applyImport() }
+                    .setNegativeButton("Cancel")  { _, _ -> cancelImportCountdown() }
+                    .create()
+                applyDialogTheme(d); d.show()
+            }
+        } else {
+            // Restart the per-second ticker with the remaining wall-clock time
+            importCountdownHandler = Handler(Looper.getMainLooper())
+            importCountdownRunnable = object : Runnable {
+                override fun run() {
+                    val remaining = importCountdownEndTime - SystemClock.elapsedRealtime()
+                    if (remaining <= 0) {
+                        tvImportCountdown.text = "00:00:00"
+                        tvImportCountdown.setOnClickListener {
+                            val d = themedDialogBuilder()
+                                .setView(themedDialogContent("Apply import?", "Import the blocklist now?"))
+                                .setPositiveButton("Confirm") { _, _ -> applyImport() }
+                                .setNegativeButton("Cancel")  { _, _ -> cancelImportCountdown() }
+                                .create()
+                            applyDialogTheme(d); d.show()
+                        }
+                    } else {
+                        val rh = (remaining / 3_600_000) % 24
+                        val rm = (remaining / 60_000)    % 60
+                        val rs = (remaining / 1_000)     % 60
+                        tvImportCountdown.text = String.format(Locale.US, "%02d:%02d:%02d", rh, rm, rs)
+                        tvImportCountdown.setOnClickListener {
+                            showResetTimerDialog { cancelImportCountdown() }
+                        }
+                        importCountdownHandler?.postDelayed(this, 1000)
+                    }
+                }
+            }
+            importCountdownHandler?.post(importCountdownRunnable!!)
+        }
     }
 
     private fun applyImport() {
         importCountdownRunnable?.let { importCountdownHandler?.removeCallbacks(it) }
         importCountdownRunnable = null
         importCountdownHandler  = null
+        prefs.edit()
+            .remove("import_countdown_end_ms")
+            .remove("import_pending_packages")
+            .remove("import_pending_urls")
+            .apply()
 
         val isDeviceOwner = dpm.isDeviceOwnerApp(packageName)
 
@@ -2187,6 +2275,7 @@ class MainActivity : Activity() {
                                 showResetTimerDialog {
                                     inCountdownMode.remove(pkg)
                                     appCountdownEndTimes.remove(pkg)
+                                    prefs.edit().remove("unblock_countdown_end_ms_$pkg").remove("pending_temp_unblock_minutes_$pkg").apply()
                                     currentRow.tvCountdown.visibility = GONE
                                     currentRow.tvCountdown.setOnClickListener(null)
                                     blockedAppRowViews[pkg]?.btnUnblock?.visibility = VISIBLE
@@ -2197,6 +2286,16 @@ class MainActivity : Activity() {
                     }
                 }
                 handler.post(ticker)
+            }
+
+            // Restore countdown from SharedPreferences if app was restarted mid-countdown
+            if (pkg !in inCountdownMode) {
+                val persistedEndMs = prefs.getLong("unblock_countdown_end_ms_$pkg", 0L)
+                if (persistedEndMs > 0L) {
+                    inCountdownMode.add(pkg)
+                    val remainingMs = persistedEndMs - System.currentTimeMillis()
+                    appCountdownEndTimes[pkg] = SystemClock.elapsedRealtime() + maxOf(remainingMs, 0L)
+                }
             }
 
             // Restore countdown UI if this item was already counting down before the list rebuilt
@@ -2239,13 +2338,18 @@ class MainActivity : Activity() {
                             val totalMs = activeDelayMinutes * 60 * 1000L
                             val endTime = SystemClock.elapsedRealtime() + totalMs
                             appCountdownEndTimes[pkg] = endTime
-                            // Store pending temp unblock duration so confirm knows it's temporary
-                            prefs.edit().putInt("pending_temp_unblock_minutes_$pkg", durationMinutes).apply()
+                            // Store pending temp unblock duration so confirm knows it's temporary,
+                            // and persist the end time so the countdown survives app restart
+                            prefs.edit()
+                                .putInt("pending_temp_unblock_minutes_$pkg", durationMinutes)
+                                .putLong("unblock_countdown_end_ms_$pkg", System.currentTimeMillis() + totalMs)
+                                .apply()
                             startAppCountdownTicker(endTime)
                         } else {
                             val totalMs = activeDelayMinutes * 60 * 1000L
                             val endTime = SystemClock.elapsedRealtime() + totalMs
                             appCountdownEndTimes[pkg] = endTime
+                            prefs.edit().putLong("unblock_countdown_end_ms_$pkg", System.currentTimeMillis() + totalMs).apply()
                             startAppCountdownTicker(endTime)
                         }
                     }
@@ -2256,6 +2360,7 @@ class MainActivity : Activity() {
                 cancelPendingUnblock(pkg)
                 inCountdownMode.remove(pkg)
                 appCountdownEndTimes.remove(pkg)
+                prefs.edit().remove("unblock_countdown_end_ms_$pkg").remove("pending_temp_unblock_minutes_$pkg").apply()
                 tvStatus.visibility = GONE
                 btnCancel.visibility = GONE
                 btnApply.visibility = GONE
@@ -2267,6 +2372,7 @@ class MainActivity : Activity() {
                 prefs.edit()
                     .putBoolean("is_pending_unblock_$pkg", false)
                     .putBoolean("is_awaiting_confirm_unblock_$pkg", false)
+                    .remove("unblock_countdown_end_ms_$pkg")
                     .apply()
                 endVerificationAttempted.remove("unblock_$pkg")
                 inCountdownMode.remove(pkg)
@@ -3038,6 +3144,7 @@ class MainActivity : Activity() {
                 }
             }
 
+            // Temporary unblock button — lets the user access this URL for up to 12h
             blockedUrlRowViews[url] = BlockedUrlRowViews(tvStatus, btnCancel, btnConfirm, btnRemove, tvCountdown)
 
             fun startUrlCountdownTicker(endTime: Long) {
@@ -3059,6 +3166,7 @@ class MainActivity : Activity() {
                                 showResetTimerDialog {
                                     inCountdownMode.remove(url)
                                     urlCountdownEndTimes.remove(url)
+                                    prefs.edit().remove("url_countdown_end_ms_$url").remove("pending_temp_unblock_minutes_url_$url").apply()
                                     currentRow.tvCountdown.visibility = GONE
                                     currentRow.tvCountdown.setOnClickListener(null)
                                     blockedUrlRowViews[url]?.btnRemove?.visibility = VISIBLE
@@ -3071,7 +3179,17 @@ class MainActivity : Activity() {
                 handler.post(ticker)
             }
 
-            // Restore countdown UI if this URL was already counting down before the list rebuilt
+            // Restore countdown from SharedPreferences if app was restarted mid-countdown
+            if (url !in inCountdownMode) {
+                val persistedEndMs = prefs.getLong("url_countdown_end_ms_$url", 0L)
+                if (persistedEndMs > 0L) {
+                    inCountdownMode.add(url)
+                    val remainingMs = persistedEndMs - System.currentTimeMillis()
+                    urlCountdownEndTimes[url] = SystemClock.elapsedRealtime() + maxOf(remainingMs, 0L)
+                }
+            }
+
+            // Restore delay-countdown UI if this URL was already counting down before the list rebuilt
             if (url in inCountdownMode) {
                 btnRemove.visibility = GONE
                 tvCountdown.visibility = VISIBLE
@@ -3084,26 +3202,39 @@ class MainActivity : Activity() {
                 }
             }
 
+            // Tapping ✕ opens the same duration dialog as apps: enter minutes for a
+            // temporary unblock (max 12h = 720 min), or leave blank to permanently remove.
+            // Either way the delay countdown runs first — temp unblock is only applied on confirm.
             btnRemove.setOnClickListener {
-                val activeDelayMinutes = prefs.getInt("saved_delay_minutes", 30)
-                btnRemove.visibility = GONE
-                tvCountdown.visibility = VISIBLE
-                inCountdownMode.add(url)
-                if (activeDelayMinutes <= 0) {
-                    urlCountdownEndTimes[url] = SystemClock.elapsedRealtime() // already expired
-                    tvCountdown.text = "00:00:00"
-                    tvCountdown.setOnClickListener { showUrlRemoveConfirmDialog(url) }
-                } else {
-                    val totalMs = activeDelayMinutes * 60 * 1000L
-                    val endTime = SystemClock.elapsedRealtime() + totalMs
-                    urlCountdownEndTimes[url] = endTime
-                    startUrlCountdownTicker(endTime)
+                showUnblockDurationDialog(url, btnRemove, tvCountdown) { durationMinutes ->
+                    val activeDelayMinutes = prefs.getInt("saved_delay_minutes", 30)
+                    btnRemove.visibility = GONE
+                    tvCountdown.visibility = VISIBLE
+                    inCountdownMode.add(url)
+                    if (durationMinutes != null) {
+                        // Store pending temp duration so confirm dialog knows to temp-unblock
+                        prefs.edit().putInt("pending_temp_unblock_minutes_url_$url", minOf(durationMinutes, 720)).apply()
+                    }
+                    if (activeDelayMinutes <= 0) {
+                        urlCountdownEndTimes[url] = SystemClock.elapsedRealtime()
+                        prefs.edit().putLong("url_countdown_end_ms_$url", System.currentTimeMillis()).apply()
+                        tvCountdown.text = "00:00:00"
+                        tvCountdown.setOnClickListener { showUrlRemoveConfirmDialog(url) }
+                    } else {
+                        val totalMs = activeDelayMinutes * 60 * 1000L
+                        val endTime = SystemClock.elapsedRealtime() + totalMs
+                        urlCountdownEndTimes[url] = endTime
+                        prefs.edit().putLong("url_countdown_end_ms_$url", System.currentTimeMillis() + totalMs).apply()
+                        startUrlCountdownTicker(endTime)
+                    }
                 }
             }
+
             btnCancel.setOnClickListener {
                 cancelPendingUrlRemove(url)
                 inCountdownMode.remove(url)
                 urlCountdownEndTimes.remove(url)
+                prefs.edit().remove("pending_temp_unblock_minutes_url_$url").remove("url_countdown_end_ms_$url").apply()
                 tvStatus.visibility = GONE
                 btnCancel.visibility = GONE
                 btnConfirm.visibility = GONE
@@ -3114,11 +3245,43 @@ class MainActivity : Activity() {
                 prefs.edit()
                     .putBoolean("is_pending_url_remove_$url", false)
                     .putBoolean("is_awaiting_confirm_url_remove_$url", false)
+                    .remove("pending_temp_unblock_minutes_url_$url")
+                    .remove("url_countdown_end_ms_$url")
                     .apply()
                 endVerificationAttempted.remove("url_remove_$url")
                 inCountdownMode.remove(url)
                 urlCountdownEndTimes.remove(url)
                 removeBlockedUrl(url)
+            }
+
+            // Restore temp-unblock UI if active (e.g. after list rebuild)
+            val urlTempUntilMs = prefs.getLong("temp_unblock_until_url_$url", 0L)
+            if (urlTempUntilMs > System.currentTimeMillis()) {
+                urlTempUnblockEndTimes[url] = urlTempUntilMs
+                btnRemove.visibility = GONE
+                tvCountdown.visibility = VISIBLE
+                tvCountdown.setOnClickListener { showUrlTempUnblockActiveDialog(url) }
+                val h2 = android.os.Handler(mainLooper)
+                val tick = object : Runnable {
+                    override fun run() {
+                        val remaining = urlTempUntilMs - System.currentTimeMillis()
+                        if (remaining <= 0) {
+                            tvCountdown.visibility = GONE
+                            tvCountdown.setOnClickListener(null)
+                            btnRemove.visibility = VISIBLE
+                            urlTempUnblockEndTimes.remove(url)
+                            return
+                        }
+                        val hh = remaining / 3_600_000
+                        val mm = (remaining % 3_600_000) / 60_000
+                        val ss = (remaining % 60_000) / 1_000
+                        tvCountdown.text = String.format(Locale.US, "%02d:%02d:%02d", hh, mm, ss)
+                        h2.postDelayed(this, 1000)
+                    }
+                }
+                h2.post(tick)
+            } else if (urlTempUntilMs > 0L) {
+                prefs.edit().remove("temp_unblock_until_url_$url").apply()
             }
 
             topRow.addView(tvDomain)
@@ -3145,6 +3308,7 @@ class MainActivity : Activity() {
             .setPositiveButton("Confirm") { _, _ ->
                 inCountdownMode.remove(pkg)
                 appCountdownEndTimes.remove(pkg)
+                prefs.edit().remove("unblock_countdown_end_ms_$pkg").apply()
                 if (isTempUnblock) {
                     prefs.edit().remove("pending_temp_unblock_minutes_$pkg").apply()
                     temporarilyUnsuspendPackage(pkg, pendingTempMinutes)
@@ -3155,7 +3319,7 @@ class MainActivity : Activity() {
             .setNegativeButton("Cancel") { _, _ ->
                 inCountdownMode.remove(pkg)
                 appCountdownEndTimes.remove(pkg)
-                prefs.edit().remove("pending_temp_unblock_minutes_$pkg").apply()
+                prefs.edit().remove("unblock_countdown_end_ms_$pkg").remove("pending_temp_unblock_minutes_$pkg").apply()
                 row?.tvCountdown?.visibility = GONE
                 row?.btnUnblock?.visibility = VISIBLE
             }
@@ -3228,7 +3392,7 @@ class MainActivity : Activity() {
                 } else {
                     val minutes = text.toIntOrNull()
                     if (minutes != null && minutes > 0) {
-                        onProceed(minutes) // temporary
+                        onProceed(minOf(minutes, 720)) // temporary, capped at 12h
                     } else {
                         onProceed(null) // invalid → permanent
                     }
@@ -3262,21 +3426,66 @@ class MainActivity : Activity() {
         refreshBlockedAppsList(dpm.isDeviceOwnerApp(packageName))
     }
 
-    private fun showUrlRemoveConfirmDialog(url: String) {
+    // Temporarily allows a blocked URL for durationMinutes, then the AccessibilityService
+    // re-blocks it once the timer expires. Mirrors temporarilyUnsuspendPackage for apps.
+    private fun temporarilyUnblockUrl(url: String, durationMinutes: Int) {
+        val reBlockAtMs = System.currentTimeMillis() + (durationMinutes * 60 * 1000L)
+        prefs.edit()
+            .putLong("temp_unblock_until_url_$url", reBlockAtMs)
+            .apply()
+        urlTempUnblockEndTimes[url] = reBlockAtMs
+        // Refresh URL list so the countdown shows in the row
+        refreshBlockedUrlsList()
+    }
+
+    // Shown when the user taps the HH:MM:SS countdown while a URL is temporarily unblocked.
+    // Mirrors showTempUnblockActiveDialog used for apps.
+    private fun showUrlTempUnblockActiveDialog(url: String) {
         val row = blockedUrlRowViews[url]
         val dialog = themedDialogBuilder()
             .setView(themedDialogContent(
+                "Temporarily unblocked",
+                "Re-block now or let the timer run out?"
+            ))
+            .setPositiveButton("Re-block") { _, _ ->
+                prefs.edit().remove("temp_unblock_until_url_$url").apply()
+                urlTempUnblockEndTimes.remove(url)
+                row?.tvCountdown?.visibility = GONE
+                row?.tvCountdown?.setOnClickListener(null)
+                row?.btnRemove?.visibility = VISIBLE
+            }
+            .setNegativeButton("Cancel", null)
+            .create()
+        applyDialogTheme(dialog)
+        dialog.show()
+    }
+
+    private fun showUrlRemoveConfirmDialog(url: String) {
+        val row = blockedUrlRowViews[url]
+        val pendingTempMinutes = prefs.getInt("pending_temp_unblock_minutes_url_$url", -1)
+        val isTempUnblock = pendingTempMinutes > 0
+
+        val dialog = themedDialogBuilder()
+            .setView(themedDialogContent(
                 "Remove block?",
-                "Are you sure you want to remove this block?"
+                if (isTempUnblock) "Unblock for $pendingTempMinutes ${if (pendingTempMinutes == 1) "minute" else "minutes"}, then re-block automatically?"
+                else "Are you sure you want to remove this block?"
             ))
             .setPositiveButton("Confirm") { _, _ ->
                 inCountdownMode.remove(url)
                 urlCountdownEndTimes.remove(url)
-                removeBlockedUrl(url)
+                prefs.edit().remove("url_countdown_end_ms_$url").apply()
+                if (isTempUnblock) {
+                    prefs.edit().remove("pending_temp_unblock_minutes_url_$url").apply()
+                    temporarilyUnblockUrl(url, pendingTempMinutes)
+                } else {
+                    removeBlockedUrl(url)
+                }
             }
             .setNegativeButton("Cancel") { _, _ ->
                 inCountdownMode.remove(url)
                 urlCountdownEndTimes.remove(url)
+                prefs.edit().remove("url_countdown_end_ms_$url").remove("pending_temp_unblock_minutes_url_$url").apply()
                 row?.tvCountdown?.visibility = GONE
                 row?.btnRemove?.visibility = VISIBLE
             }
@@ -3359,7 +3568,8 @@ class MainActivity : Activity() {
             row.btnApply.visibility = GONE
 
             if (!isPending) {
-                if (verifyKey !in awaitingInitialFetch && url !in inCountdownMode) {
+                val isTempUnblocked = prefs.getLong("temp_unblock_until_url_$url", 0L) > System.currentTimeMillis()
+                if (verifyKey !in awaitingInitialFetch && url !in inCountdownMode && !isTempUnblocked) {
                     row.tvStatus.visibility  = GONE
                     row.btnCancel.visibility = GONE
                     row.btnRemove.visibility = VISIBLE
