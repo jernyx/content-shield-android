@@ -115,11 +115,11 @@ class BlockerAccessibilityService : AccessibilityService() {
                 Regex("^[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}(/.*)?$").matches(t)
     }
 
-    // Returns true if the URL matches a blocked pattern.
+    // Returns true if the URL matches a blocked pattern and is not currently temp-unblocked.
     // Blocked patterns are stored as plain path prefixes, e.g. "instagram.com/reels"
     // or "discord.com/invite". A full domain like "instagram.com" is NOT a match — only
     // subpaths are. Comparison is case-insensitive and ignores the scheme (http/https).
-    private fun isUrlBlocked(rawUrl: String, blockedUrls: Set<String>): Boolean {
+    private fun isUrlBlocked(rawUrl: String, blockedUrls: Set<String>, prefs: android.content.SharedPreferences): Boolean {
         if (blockedUrls.isEmpty()) return false
 
         // Strip scheme and trailing slash for comparison
@@ -128,6 +128,8 @@ class BlockerAccessibilityService : AccessibilityService() {
             .removePrefix("http://")
             .trimEnd('/')
             .lowercase()
+
+        val nowMs = System.currentTimeMillis()
 
         for (pattern in blockedUrls) {
             val p = pattern.trim().lowercase().trimEnd('/')
@@ -139,11 +141,36 @@ class BlockerAccessibilityService : AccessibilityService() {
             if (!p.contains('/')) continue
 
             if (url == p || url.startsWith("$p/") || url.startsWith("$p?")) {
+                // Check if this pattern is currently temporarily unblocked
+                val tempUntilMs = prefs.getLong("temp_unblock_until_url_$pattern", 0L)
+                if (tempUntilMs > nowMs) {
+                    Log.d("ContentShield", "URL temp-unblocked: $url matches $p, skipping block until $tempUntilMs")
+                    return false
+                }
                 Log.d("ContentShield", "URL BLOCKED: $url matched pattern: $p")
                 return true
             }
         }
         return false
+    }
+
+    // Checks all URL patterns that have a temporary unblock timer. If any have expired,
+    // clears the pref so blocking resumes. Event-driven — no timers or alarms needed.
+    private fun checkAndReApplyExpiredTempUrlUnblocks(prefs: android.content.SharedPreferences) {
+        val blockedUrls = prefs.getStringSet("blocked_urls", emptySet()) ?: emptySet()
+        if (blockedUrls.isEmpty()) return
+        val nowMs = System.currentTimeMillis()
+        val edit = prefs.edit()
+        var changed = false
+        for (url in blockedUrls) {
+            val tempUntilMs = prefs.getLong("temp_unblock_until_url_$url", 0L)
+            if (tempUntilMs > 0L && nowMs >= tempUntilMs) {
+                edit.remove("temp_unblock_until_url_$url")
+                changed = true
+                Log.d("ContentShield", "URL temp unblock expired, re-blocking: $url")
+            }
+        }
+        if (changed) edit.apply()
     }
 
     // Checks all packages that have a temporary unblock timer. If any have expired,
@@ -179,6 +206,7 @@ class BlockerAccessibilityService : AccessibilityService() {
         // no timers). This is the mechanism that auto-re-blocks after temp duration expires.
         val prefs = getSharedPreferences("ContentShieldPrefs", Context.MODE_PRIVATE)
         checkAndReApplyExpiredTempUnblocks(prefs)
+        checkAndReApplyExpiredTempUrlUnblocks(prefs)
 
         // --- Settings tamper-protection (existing logic, unchanged) ---
         if (pkg in settingsPackages) {
@@ -238,7 +266,7 @@ class BlockerAccessibilityService : AccessibilityService() {
                     val url = extractBrowserUrl(pkg, rootNode)
                     rootNode.recycle()
 
-                    if (url != null && isUrlBlocked(url, blockedUrls)) {
+                    if (url != null && isUrlBlocked(url, blockedUrls, prefs)) {
                         performGlobalAction(GLOBAL_ACTION_BACK)
                     }
                 }
